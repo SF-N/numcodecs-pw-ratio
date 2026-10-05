@@ -161,6 +161,43 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
             Encoded data as a bytestring.
         """
 
+        return self._encode(buf, None)
+
+    def encode_masked(
+        self, buf: Buffer, mask: "np.ndarray[tuple[int, ...], np.dtype[np.bool]]"
+    ) -> bytes:
+        """Encode the data in `buf`, ignoring the values where `mask` is
+        [`True`][True].
+
+        This method implements the mask-aware codec protocol of
+        [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io). The masked
+        values do not contribute to the derived absolute error bound for the
+        logarithms, to the sign plane, or to the zero flags, and the mask is
+        forwarded to the `log_codec` if it implements the protocol itself.
+        The values at masked positions are unspecified.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Data to be encoded. May be any object supporting the new-style
+            buffer protocol. The values at masked positions are unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : bytes
+            Encoded data as a bytestring.
+        """
+
+        return self._encode(buf, mask)
+
+    def _encode(
+        self,
+        buf: Buffer,
+        mask: "Optional[np.ndarray[tuple[int, ...], np.dtype[np.bool]]]",
+    ) -> bytes:
         a = numcodecs.compat.ensure_ndarray(buf)
         dtype, shape = a.dtype, a.shape
 
@@ -168,12 +205,16 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
             raise TypeError("can only encode floating point values")
 
         signs = np.signbit(a)
+        if mask is not None:
+            signs &= ~mask
         save_signs = np.any(signs)
 
         logs = np.copy(a)
         np.negative(logs, out=logs, where=signs, casting="equiv")
 
         valid_logs = np.isfinite(logs) & (logs > 0)
+        if mask is not None:
+            valid_logs &= ~mask
 
         np.log2(logs, out=logs, where=valid_logs, casting="equiv")
 
@@ -195,7 +236,13 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
             np.nextafter(threshold, dtype.type(-np.inf)), min_log_data - 2.0001 * eb_abs
         )
 
-        logs[a == 0] = zero_flag
+        logs[(a == 0) if mask is None else ((a == 0) & ~mask)] = zero_flag
+
+        if mask is not None:
+            # the masked values are unspecified: fill them with an in-range
+            # constant so that they are cheap to encode if the log codec is
+            # not mask-aware, and cannot corrupt the derived bounds
+            logs[mask] = min_log_data if np.isfinite(min_log_data) else 0.0
 
         logs_codec: Codec = numcodecs.registry.get_codec(
             _replace_eb_abs_in_config(
@@ -205,7 +252,12 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
             )
         )
 
-        logs_encoded = logs_codec.encode(logs if eb_abs > 0 else a)
+        if mask is not None and _is_mask_aware(logs_codec):
+            logs_encoded = logs_codec.encode_masked(  # type: ignore
+                logs if eb_abs > 0 else a, mask
+            )
+        else:
+            logs_encoded = logs_codec.encode(logs if eb_abs > 0 else a)
         logs_encoded = numcodecs.compat.ensure_ndarray(logs_encoded)
 
         if save_signs and (eb_abs > 0):
@@ -323,6 +375,48 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
             protocol.
         """
 
+        return self._decode(buf, None, out)
+
+    def decode_masked(
+        self,
+        buf: Buffer,
+        mask: "np.ndarray[tuple[int, ...], np.dtype[np.bool]]",
+        out: Optional[Buffer] = None,
+    ) -> Buffer:
+        """Decode the data in `buf`, which was encoded with the same `mask`.
+
+        This method implements the mask-aware codec protocol of
+        [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io), matching
+        [`encode_masked`][numcodecs_pw_ratio.PointwiseRatioErrorBoundedCodec.encode_masked].
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. Must be an object representing a bytestring, e.g.
+            [`bytes`][bytes] or a 1D array of [`np.uint8`][numpy.uint8]s etc.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to
+            [`encode_masked`][numcodecs_pw_ratio.PointwiseRatioErrorBoundedCodec.encode_masked].
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this
+            buffer must be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        return self._decode(buf, mask, out)
+
+    def _decode(
+        self,
+        buf: Buffer,
+        mask: "Optional[np.ndarray[tuple[int, ...], np.dtype[np.bool]]]",
+        out: Optional[Buffer] = None,
+    ) -> Buffer:
         b = numcodecs.compat.ensure_bytes(buf)
         b_io = BytesIO(b)
 
@@ -423,7 +517,15 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
                 float(eb_abs) if isinstance(eb_abs, float) else eb_abs,  # type: ignore
             )
         )
-        logs_codec.decode(logs_encoded, out=logs)
+        if mask is not None and _is_mask_aware(logs_codec):
+            logs_codec.decode_masked(logs_encoded, mask, out=logs)  # type: ignore
+        else:
+            logs_codec.decode(logs_encoded, out=logs)
+
+        if mask is not None:
+            # the masked values are unspecified: make them finite so that the
+            # exponentiation below cannot overflow
+            logs[mask] = 0
 
         if threshold is not None:
             np.exp2(
@@ -524,6 +626,15 @@ class PointwiseRatioErrorBoundedCodec(Codec, CodecCombinatorMixin):
         codec._mapper = lambda x: mapper(old_mapper(x))
 
         return codec
+
+
+def _is_mask_aware(codec: Codec) -> bool:
+    """Check for the mask-aware codec protocol of
+    [`numcodecs-mask`](https://numcodecs-mask.readthedocs.io) structurally, so
+    that `numcodecs-pw-ratio` does not need to depend on it."""
+    return callable(getattr(codec, "encode_masked", None)) and callable(
+        getattr(codec, "decode_masked", None)
+    )
 
 
 def _replace_eb_abs_in_config(config: dict, eb_abs_marker: str, eb_abs: float) -> dict:
